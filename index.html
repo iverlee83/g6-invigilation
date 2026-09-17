@@ -125,6 +125,14 @@ License: MIT
         <input type="text" id="school-year" value="2627" placeholder="2627">
       </div>
     </div>
+    <div style="margin-top:14px">
+      <label>Teachers Not Available (maternity leave, pre-approved leave, etc.)</label>
+      <textarea id="blocked-teachers" rows="3" placeholder="LWK, JH&#10;TZC: 6-Nov&#10;MF: Friday, 9-Nov"
+        style="width:100%; padding:10px 12px; border:1px solid #cbd5e0; border-radius:8px; font-family:inherit; font-size:0.95rem; resize:vertical;"></textarea>
+      <p class="hint">Initials only. One per line or comma separated. A bare initial blocks every exam day; add
+        <strong>: date or day</strong> to block only those days &mdash; e.g. <code>TZC: 6-Nov</code> or <code>MF: Friday, 9-Nov</code>.
+        Blocked teachers get no invigilation, duty or lesson&nbsp;5 slots; the next teacher in the priority chain takes over.</p>
+    </div>
   </div>
 
   <!-- STEP 6: Generate -->
@@ -170,6 +178,14 @@ License: MIT
 //  - Lesson-swap flag: any teacher on 4 G6 invigilation lessons who still has
 //    a G1-5 lesson at lesson 5 is flagged (Remark column) so cover can be
 //    arranged, otherwise they are overloaded.
+//  - Teachers not available (maternity leave, pre-approved leave): typed into
+//    the "Teachers Not Available" box as initials. A bare initial blocks every
+//    exam day; "TZC: 6-Nov" or "MF: Friday, 9-Nov" blocks those days only.
+//    A blocked teacher gets no invigilation, duty, morning homeroom or lesson
+//    5 slot; the priority chain carries on to the next eligible teacher and
+//    every substitution is logged. They stay listed in the teacher-per-day,
+//    duty count and Balance blocks with zero, and each day sheet carries a
+//    "Not available (leave)" note.
 //  - Recess, Dismissal and SEN invigilator slots: left BLANK (manual).
 //  - Cross Campus Teachers (LCY/KKK/MCL excluded): campus shown = where today's
 //    duty puts them, else their Teacher-Timetable lessons that weekday, else
@@ -381,6 +397,55 @@ function examSubjToRosterKeys(subj) {
 const CROSS_CAMPUS_EXCLUDE = ['LCY','KKK','MCL'];
 const CROSS_CAMPUS_DAY_COL = {'Monday':'Mon','Tuesday':'Tue','Wednesday':'Wed','Thursday':'Thur','Friday':'Fri'};
 
+// ─── Teachers not available (maternity leave, pre-approved leave, etc.) ────
+// Input is free text, one entry per line or comma separated:
+//   "LWK"              -> blocked on every exam day
+//   "TZC: 6-Nov"       -> blocked on that date only
+//   "MF: Friday, 9-Nov"-> blocked on that weekday and that date
+// Returns { initial: true }            for a whole-period block
+//      or { initial: Set(day keys) }   for specific days.
+// Day keys are matched against both the weekday name and the CSV date.
+function parseBlockedTeachers(text) {
+  const out = {};
+  const entries = [];
+  for (const line of strip(text).split(/\r?\n/)) {
+    // Split on commas only when the line has no "initials:" prefix, so
+    // "MF: Friday, 9-Nov" stays one entry but "LWK, JH" becomes two.
+    if (/:/.test(line)) entries.push(line);
+    else for (const part of line.split(',')) entries.push(part);
+  }
+  for (const raw of entries) {
+    const e = strip(raw);
+    if (!e) continue;
+    const i = e.indexOf(':');
+    const init = strip(i < 0 ? e : e.slice(0, i));
+    if (!init) continue;
+    const scope = i < 0 ? '' : strip(e.slice(i + 1));
+    if (!scope) { out[init] = true; continue; }
+    if (out[init] === true) continue;              // already blocked everywhere
+    const days = out[init] || new Set();
+    for (const d of scope.split(',')) { const s = strip(d).toLowerCase(); if (s) days.add(s); }
+    out[init] = days;
+  }
+  return out;
+}
+
+// Is `teacher` unavailable on this exam day? `day` is the weekday name
+// ("Friday") and `date` the CSV date ("6-Nov").
+function isBlocked(blocked, teacher, day, date) {
+  const b = teacher && blocked[teacher];
+  if (!b) return false;
+  if (b === true) return true;
+  const d = strip(day).toLowerCase(), dt = strip(date).toLowerCase();
+  for (const key of b) {
+    if (key === d || key === dt) return true;
+    // tolerate "6 Nov" / "6/Nov" / "06-Nov" against a CSV date of "6-Nov"
+    const norm = s => s.replace(/^0+/, '').replace(/[\s\/]/g, '-');
+    if (norm(key) === norm(dt)) return true;
+  }
+  return false;
+}
+
 // ─── Period grid constants (Teacher Timetable layout) ──────────────────────
 const DAY_COL = {'Monday':'C','Tuesday':'E','Wednesday':'H','Thursday':'J','Friday':'M'};
 const PERIOD_ROWS = {HR:6, P1:8, P2:10, P3:13, P4:15, P5:18, P6:20, P7:24};
@@ -527,6 +592,7 @@ function generate() {
 
   const label = strip(document.getElementById('exam-label').value) || 'T1 SA';
   const year  = strip(document.getElementById('school-year').value) || '2627';
+  const blockedTeachers = parseBlockedTeachers(document.getElementById('blocked-teachers').value);
 
   const rosterMap = buildRosterMap(rosterData);
   const allClasses = Object.keys(rosterMap).sort();
@@ -557,6 +623,12 @@ function generate() {
   const crossRows = (crossCampusData||[]).filter(r => !CROSS_CAMPUS_EXCLUDE.includes(strip(r['Initials']).toUpperCase()));
   const crossSet = new Set(crossRows.map(r => strip(r['Initials'])));
   log(`✓ Cross Campus Teachers: ${crossRows.length} listed (${CROSS_CAMPUS_EXCLUDE.join(', ')} excluded)`, 'ok');
+  const blockedList = Object.keys(blockedTeachers);
+  if (blockedList.length) {
+    log(`✓ Not available: ${blockedList.map(t => blockedTeachers[t]===true ? t : `${t} (${[...blockedTeachers[t]].join(', ')})`).join('; ')}`, 'warn');
+    const unknown = blockedList.filter(t => !teacherTT[t]);
+    if (unknown.length) log(`  ⚠ Not in the Teacher Timetable, check the initials: ${unknown.join(', ')}`, 'warn');
+  }
 
   const balanceCount = {};        // teacher -> total duties across the whole period (workload balance)
   const dailyWeight = {};         // teacher -> { day -> weight } (cap = 4 on standard days)
@@ -574,6 +646,12 @@ function generate() {
     const hasCombined = dayObj.sessions.some(s => examSubjToRosterKeys(s.subject).length > 1);
 
     const classResult = {};   // cls -> { sessions:[...], homeroom }
+    // Teachers not available today (maternity leave, pre-approved leave, ...).
+    // They are never given a duty; the priority chain simply carries on to the
+    // next eligible teacher, and every substitution is logged.
+    const avail = t => !!t && !isBlocked(blockedTeachers, t, day, dayObj.date);
+    const blockedToday = Object.keys(blockedTeachers).filter(t => isBlocked(blockedTeachers, t, day, dayObj.date));
+    if (blockedToday.length) log(`  Not available ${day}: ${blockedToday.join(', ')}`, 'warn');
     const dayTeacherCampus = {}; // teacher -> campus where our duty puts them today
     const placed = (t, cls) => { if (t && !dayTeacherCampus[t]) dayTeacherCampus[t] = rosterMap[cls].campus; };
     for (const cls of g6Classes) classResult[cls] = { sessions: [] };
@@ -594,10 +672,11 @@ function generate() {
         // science teacher of the neighbouring class". DH: own subject teacher.
         const subjKey = isCombined ? 'Sci' : (subjKeys[0] || null);
         const own = subjKey ? (info[subjKey]||'') : '';
-        if (campus === 'DH') {
-          candidate = own || info['HR1'];
+        if (campus === 'DH' && avail(own)) {
+          candidate = own;
           reason = 'DH exception: own subject teacher, direct';
         } else {
+          if (campus === 'DH' && own) log(`  ↳ ${day} ${cls}: ${own} not available, taking the next in the chain`, 'warn');
           const tiers = [[],[],[]];
           for (const [c2, info2] of Object.entries(rosterMap)) {
             if (info2.campus !== campus || c2 === cls) continue;
@@ -606,7 +685,7 @@ function generate() {
             for (const k of TKEYS) { const t3 = info2[k]; if (t3 && t3 !== own) tiers[2].push(t3); }
           }
           const pick = (arr) => {
-            const uniq = [...new Set(arr)].filter(t => !usedThisSession[campus].has(t));
+            const uniq = [...new Set(arr)].filter(t => !usedThisSession[campus].has(t) && avail(t));
             if (!uniq.length) return null;
             if (isCombined) {
               // whole-morning block: prefer fewest real (non-G6) conflicts, then workload
@@ -619,8 +698,10 @@ function generate() {
             if (underCap.length===0) log(`  ⚠ ${day} ${session.label} ${cls}: daily cap relaxed for ${pool2[0]}`, 'warn');
             return pool2[0];
           };
-          candidate = pick(tiers[0]) || pick(tiers[1]) || pick(tiers[2]) || own || info['HR1'];
+          candidate = pick(tiers[0]) || pick(tiers[1]) || pick(tiers[2])
+                   || (avail(own) ? own : null) || (avail(info['HR1']) ? info['HR1'] : null) || null;
           reason = tiers[0].length ? 'same-grade, same-subject, different class' : tiers[1].length ? 'same-campus, same-subject, different grade' : 'same-campus, any teacher';
+          if (!candidate) log(`  ⚠ ${day} ${session.label} ${cls}: nobody available — left blank`, 'err');
         }
         if (candidate) usedThisSession[campus].add(candidate);
         bump(candidate, periods.length);
@@ -645,7 +726,7 @@ function generate() {
         for (const cls of g6Classes) {
           const info = rosterMap[cls];
           const sess = classResult[cls].sessions.at(-1);
-          const cand2 = new Set(TKEYS.map(k => info[k]).filter(Boolean));
+          const cand2 = new Set(TKEYS.map(k => info[k]).filter(t => t && avail(t)));
           for (const t of invigilators) cand2.delete(t);
           const ranked = [...cand2].sort((a,b) => (freeCount(teacherTT,b,day,periods) - freeCount(teacherTT,a,day,periods)) || ((balanceCount[a]||0)-(balanceCount[b]||0)));
           const lessons = {};
@@ -677,16 +758,26 @@ function generate() {
     // teacher, then a lesson-7 / study-hall cell that names the class, then
     // any of the class's own subject teachers who is free at lesson 5 and
     // still under the cap.
+    const homeroomMorning = {};
     if (!hasCombined) {
       for (const cls of g6Classes) {
         const info = rosterMap[cls];
-        const chain = ['P5','P6','P7'].map(p => classPeriodTeacher[cls]?.[day]?.[p]?.teacher).filter(Boolean);
-        const ownFree = TKEYS.map(k => info[k]).filter(t => t && !chain.includes(t) && !(((teacherTT[t]||{})[day]||{})['P5']));
+        // Morning homeroom (08:20-08:55): the class's own HR teacher, or the
+        // second HR teacher / an available own subject teacher if they are on
+        // leave. Does not count towards the 4-lesson daily cap.
+        const hrChain = [info.HR1, info.HR2, ...TKEYS.map(k => info[k])].filter(Boolean);
+        homeroomMorning[cls] = hrChain.find(avail) || '';
+        if (info.HR1 && !avail(info.HR1)) log(`  \u21b3 ${day} ${cls} homeroom: ${info.HR1} not available \u2014 ${homeroomMorning[cls] || 'left blank'}`, 'warn');
+        const rawChain = ['P5','P6','P7'].map(p => classPeriodTeacher[cls]?.[day]?.[p]?.teacher).filter(Boolean);
+        const chain = rawChain.filter(avail);
+        if (rawChain.length && !avail(rawChain[0])) log(`  ↳ ${day} ${cls} lesson 5: ${rawChain[0]} not available, taking the next in the chain`, 'warn');
+        const ownFree = TKEYS.map(k => info[k]).filter(t => t && avail(t) && !chain.includes(t) && !(((teacherTT[t]||{})[day]||{})['P5']));
         const underCap = t => t && dailyLoad(t, day) + 1 <= DAILY_CAP;
-        let hr = chain.find(underCap) || ownFree.find(underCap) || chain[0] || info.HR1;
+        let hr = chain.find(underCap) || ownFree.find(underCap) || chain[0] || ownFree[0] || (avail(info.HR1) ? info.HR1 : null);
+        if (!hr) log(`  ⚠ ${day} ${cls} lesson 5: nobody available — left blank`, 'err');
         bump(hr, 1); bumpDaily(hr, day, 1);
         classResult[cls].homeroom = hr;
-        placed(info.HR1, cls); placed(hr, cls);
+        placed(homeroomMorning[cls], cls); placed(hr, cls);
         // Recess and Dismissal: left blank (manual).
       }
     }
@@ -704,7 +795,7 @@ function generate() {
                             remark:`${dailyLoad(t, day)} G6 invigilation lessons today` });
     }
 
-    dayResults.push({ day, date:dayObj.date, hasCombined, classResult, sessions:dayObj.sessions, dayTeacherCampus });
+    dayResults.push({ day, date:dayObj.date, hasCombined, classResult, sessions:dayObj.sessions, dayTeacherCampus, homeroomMorning, blockedToday });
   }
   progress(60);
   log(`✓ Assignment complete. ${lessonSwapRows.length} lesson-swap conflicts detected.`, lessonSwapRows.length?'warn':'ok');
@@ -730,6 +821,8 @@ function generate() {
     ccTitle: { font:{name:'Arial', sz:12, bold:true}, fill:fill('FFFF00'), alignment:CTR, border:BRD },
     ccCell:  { font:{name:'Arial', sz:12}, alignment:CTR, border:BRD },
     ccHi:    { font:{name:'Arial', sz:12, bold:true, color:{rgb:'9C0006'}}, fill:fill('FFC7CE'), alignment:CTR, border:BRD },
+    naHdr:   { font:{name:'Arial', sz:12, bold:true, color:{rgb:'9C0006'}}, fill:fill('FFC7CE'), alignment:CTR, border:BRD },
+    naCell:  { font:{name:'Arial', sz:12}, alignment:{horizontal:'left', vertical:'center', wrapText:true}, border:BRD },
     tpdHdr:  { font:{name:'Arial', sz:16, bold:true}, fill:fill('FBE3D6'), alignment:CTR, border:BRD },
     tpdInit: { font:{name:'Arial', sz:12}, fill:fill('FBE3D6'), alignment:CTR, border:BRD },
     tpdCell: { font:{name:'Aptos Narrow', sz:20}, alignment:CTR, border:BRD },
@@ -789,7 +882,8 @@ function generate() {
         const morn = cres.sessions[0], aft = cres.sessions[1];
         const lbl = s => s ? (s.notes ? `${s.subject}\n(${s.notes.replace(/^Actual exam\s*/i,'')})` : s.subject) : '';
         setStr(sc,5,'Homeroom', STY.subj); ensure(sc,6).s = STY.subj; addMerge(sc,5,sc,6);
-        initRow(sc+1,5, info.HR1); initRow(sc+1,6, info.HR1);
+        const hrMorning = dr.homeroomMorning[cls] || '';
+        initRow(sc+1,5, hrMorning); initRow(sc+1,6, hrMorning);
         setStr(sc,7, lbl(morn), STY.subj); ensure(sc,8).s = STY.subj; addMerge(sc,7,sc,8);
         initRow(sc+1,7, morn && morn.invigilator); initRow(sc+1,8, morn && morn.invigilator);
         setStr(sc,9,'Recess', STY.subjRec); initRow(sc+1,9, '');
@@ -818,6 +912,15 @@ function generate() {
     styleRange(senStart,3,senStart+5,3,STY.senCell); addMerge(senStart,3,senStart+5,3);
     ['TP','MK','DH'].forEach((lbl,i) => { const c0=senStart+i*2; setStr(c0,4,lbl, STY.senHdr); ensure(c0+1,4).s=STY.senHdr; addMerge(c0,4,c0+1,4); });
     styleRange(senStart,5,senStart+5,14,STY.senCell);
+
+    // ── Not available today (leave) — teachers excluded from every duty ─────
+    if (dr.blockedToday.length) {
+      setStr(senStart,16,'Not available (leave)', STY.naHdr);
+      styleRange(senStart,16,senStart+5,16,STY.naHdr); addMerge(senStart,16,senStart+5,16);
+      const names = dr.blockedToday.map(t => nameLookup[t] ? `${t} \u2014 ${nameLookup[t]}` : t).join(';  ');
+      setStr(senStart,17, names, STY.naCell);
+      styleRange(senStart,17,senStart+5,17,STY.naCell); addMerge(senStart,17,senStart+5,17);
+    }
 
     // ── Cross Campus Teachers — where each teacher actually is today ────────
     const ccStart = senStart + 7;
@@ -874,7 +977,7 @@ function generate() {
     setStr(dcStart-1, 15, 'Total', STY.dcTotalLbl);
 
     const finalCol = tc - 1;
-    const lastRow = Math.max(15, 3 + crossRows.length);
+    const lastRow = Math.max(15, 3 + crossRows.length, dr.blockedToday.length ? 17 : 0);
     ws['!ref'] = XLSX.utils.encode_range({ s:{r:0,c:0}, e:{r:lastRow-1, c:finalCol-1} });
     ws['!merges'] = merges;
     const cols = [{wch:25.2}];
