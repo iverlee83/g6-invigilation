@@ -166,9 +166,17 @@ License: MIT
 //  - Tuesday (Science Prediction / Chi Speaking / Eng Speaking): per class
 //    subject | duty | duty name | invigilator | invigilator name. Invigilator =
 //    the Science teacher of the neighbouring class (same chain, subject = Sci).
-//    Duty teachers = the class's own subject/HR teachers with the most free
-//    periods, filled per time slot, max 3 lesson rows each (recess rows keep
-//    the adjacent duty teacher and don't count); no swaps for duty teachers.
+//    Duty teacher per time slot = whoever is TIMETABLED with that class in
+//    that period (their G6 lesson is freed by the assessment). If that teacher
+//    is invigilating elsewhere or on leave, the slot goes to a same-campus
+//    teacher with relatively fewer lessons that day who is free then, own-class
+//    teachers preferred on a tie; every substitution is logged. The two recess
+//    rows have a BLANK duty cell (the invigilator still runs down every row).
+//    08:20-08:55 is the exception to the timetable rule: a teacher who holds
+//    no homeroom anywhere on that campus goes in, so the class's own HR
+//    teacher stays free. No swaps for duty teachers.
+//  - Homeroom 08:20-08:55: the literal text HRT in the initials cell, not a
+//    named teacher (matches the reference workbook).
 //  - Lesson 5 (11:45-12:20): the teacher who normally has lesson 5 with that
 //    class goes in (6F Monday lesson 5 = English -> the 6F English teacher).
 //    If that teacher already has 4 invigilation lessons that day: lesson-6
@@ -620,6 +628,20 @@ function generate() {
   progress(35);
 
   const TKEYS = ['HR1','HR2','Chi','Eng','Maths','GS','Sci','Music','PE','VA'];
+  // every teacher who appears on each campus in the roster — the pool a
+  // stand-in duty teacher can be drawn from
+  const campusTeachers = { TP:new Set(), MK:new Set(), DH:new Set() };
+  for (const info of Object.values(rosterMap)) {
+    for (const k of TKEYS) { const t = info[k]; if (t) campusTeachers[info.campus]?.add(t); }
+  }
+  // teachers who hold no homeroom anywhere on their campus — the pool the
+  // Tuesday 08:20-08:55 homeroom slot is drawn from
+  const hrHolders = { TP:new Set(), MK:new Set(), DH:new Set() };
+  for (const info of Object.values(rosterMap)) {
+    for (const k of ['HR1','HR2']) { const t = info[k]; if (t) hrHolders[info.campus]?.add(t); }
+  }
+  const nonHomeroom = {};
+  for (const c of campusOrder) nonHomeroom[c] = [...campusTeachers[c]].filter(t => !hrHolders[c].has(t));
   const crossRows = (crossCampusData||[]).filter(r => !CROSS_CAMPUS_EXCLUDE.includes(strip(r['Initials']).toUpperCase()));
   const crossSet = new Set(crossRows.map(r => strip(r['Initials'])));
   log(`✓ Cross Campus Teachers: ${crossRows.length} listed (${CROSS_CAMPUS_EXCLUDE.join(', ')} excluded)`, 'ok');
@@ -714,35 +736,73 @@ function generate() {
       }
 
       // Duty teachers (combined day only) — second pass, once every class's
-      // invigilator is known so nobody is double-booked. For each class: its
-      // own subject/HR teachers ranked by most free periods in the block,
-      // filled per time-slot row, max 3 lesson rows each; a teacher already
-      // invigilating or on duty elsewhere in that row is skipped. Recess rows
-      // keep the adjacent duty teacher and don't count towards the 3.
+      // invigilator is known. The teacher who is TIMETABLED with that class in
+      // that period takes the slot: on this morning their G6 class is in
+      // assessment, so they are the ones freed up to mind it.
+      //
+      // If that teacher cannot come — they are invigilating another class, or
+      // on leave — the slot goes to a teacher with relatively fewer lessons
+      // that day (same campus, free at that period), preferring one of the
+      // class's own teachers on a tie. Every substitution is logged.
+      // Recess rows keep whoever was with the class in the period before.
       if (isCombined) {
         const invigilators = new Set(g6Classes.map(c => classResult[c].sessions.at(-1).invigilator).filter(Boolean));
         const rowBusy = ROW_PERIODS.slice(0,9).map(() => new Set());
-        const free = (t, p) => !(((teacherTT[t]||{})[day]||{})[p]);
+        const freeAt = (t, p) => !(((teacherTT[t]||{})[day]||{})[p]);
+        // how many lessons this teacher actually teaches today — the
+        // "relatively fewer lessons" measure
+        const dayLessons = t => PERIOD_ORDER.filter(p => {
+          const v = ((teacherTT[t]||{})[day]||{})[p];
+          return v && /^\S+\s*\/\s*/.test(v) && !/co-plan/i.test(v);
+        }).length;
+        const dutyCount = {};
         for (const cls of g6Classes) {
           const info = rosterMap[cls];
+          const campus = info.campus;
           const sess = classResult[cls].sessions.at(-1);
-          const cand2 = new Set(TKEYS.map(k => info[k]).filter(t => t && avail(t)));
-          for (const t of invigilators) cand2.delete(t);
-          const ranked = [...cand2].sort((a,b) => (freeCount(teacherTT,b,day,periods) - freeCount(teacherTT,a,day,periods)) || ((balanceCount[a]||0)-(balanceCount[b]||0)));
-          const lessons = {};
-          let last = null;
+          const own = new Set(TKEYS.map(k => info[k]).filter(Boolean));
+          let hrPick;   // 08:20-08:55 spans two rows — same teacher in both
+          const rank = (a,b) => (dayLessons(a) - dayLessons(b))
+                             || ((own.has(b)?1:0) - (own.has(a)?1:0))
+                             || ((dutyCount[a]||0) - (dutyCount[b]||0))
+                             || ((balanceCount[a]||0) - (balanceCount[b]||0));
           sess.rowDuty = ROW_PERIODS.slice(0,9).map((pkey, i) => {
-            if (!ranked.length) return null;
-            const avail = ranked.filter(t => !rowBusy[i].has(t));
-            let chosen;
-            if (pkey === null) chosen = (last && !rowBusy[i].has(last)) ? last : (avail[0] || null);
-            else chosen = avail.find(t => free(t,pkey) && (lessons[t]||0) < DUTY_MAX_LESSONS)
-                       || avail.find(t => (lessons[t]||0) < DUTY_MAX_LESSONS)
-                       || avail.find(t => free(t,pkey)) || avail[0] || null;
+            let chosen = null;
+            if (pkey === null) {
+              // recess (10:05-10:20, 11:30-11:45): duty column left blank
+              chosen = null;
+            } else if (pkey === 'HR') {
+              // 08:20-08:55 homeroom: a teacher who holds no homeroom on this
+              // campus goes in, so the class's own HR teacher stays free.
+              if (hrPick !== undefined) chosen = hrPick;
+              else {
+                const pool = nonHomeroom[campus].filter(t =>
+                  avail(t) && !invigilators.has(t) && !rowBusy[i].has(t) && freeAt(t, 'HR'));
+                pool.sort(rank);
+                chosen = pool[0] || null;
+                hrPick = chosen;
+                if (!chosen) log(`  \u26a0 ${day} ${cls} homeroom: no non-homeroom teacher free \u2014 left blank`, 'err');
+              }
+            } else {
+              const scheduled = classPeriodTeacher[cls]?.[day]?.[pkey]?.teacher || null;
+              if (scheduled && avail(scheduled) && !invigilators.has(scheduled) && !rowBusy[i].has(scheduled)) {
+                chosen = scheduled;
+              } else {
+                const pool = [...campusTeachers[campus]].filter(t =>
+                  avail(t) && !invigilators.has(t) && !rowBusy[i].has(t) && freeAt(t, pkey));
+                pool.sort(rank);
+                chosen = pool[0] || null;
+                if (scheduled) {
+                  const why = invigilators.has(scheduled) ? 'invigilating' : 'not available';
+                  log(`  \u21b3 ${day} ${cls} ${PERIOD_NUM[pkey]==='HR'?'homeroom':'lesson '+PERIOD_NUM[pkey]}: ${scheduled} is ${why} \u2014 ${chosen || 'nobody free, left blank'} covers`, 'warn');
+                } else if (!chosen) {
+                  log(`  \u26a0 ${day} ${cls} ${pkey}: no teacher timetabled and nobody free \u2014 left blank`, 'err');
+                }
+              }
+            }
             if (chosen) {
               rowBusy[i].add(chosen);
-              if (pkey !== null) lessons[chosen] = (lessons[chosen]||0) + 1;
-              last = chosen;
+              if (pkey !== null) dutyCount[chosen] = (dutyCount[chosen]||0) + 1;
             }
             return chosen;
           });
@@ -758,16 +818,9 @@ function generate() {
     // teacher, then a lesson-7 / study-hall cell that names the class, then
     // any of the class's own subject teachers who is free at lesson 5 and
     // still under the cap.
-    const homeroomMorning = {};
     if (!hasCombined) {
       for (const cls of g6Classes) {
         const info = rosterMap[cls];
-        // Morning homeroom (08:20-08:55): the class's own HR teacher, or the
-        // second HR teacher / an available own subject teacher if they are on
-        // leave. Does not count towards the 4-lesson daily cap.
-        const hrChain = [info.HR1, info.HR2, ...TKEYS.map(k => info[k])].filter(Boolean);
-        homeroomMorning[cls] = hrChain.find(avail) || '';
-        if (info.HR1 && !avail(info.HR1)) log(`  \u21b3 ${day} ${cls} homeroom: ${info.HR1} not available \u2014 ${homeroomMorning[cls] || 'left blank'}`, 'warn');
         const rawChain = ['P5','P6','P7'].map(p => classPeriodTeacher[cls]?.[day]?.[p]?.teacher).filter(Boolean);
         const chain = rawChain.filter(avail);
         if (rawChain.length && !avail(rawChain[0])) log(`  ↳ ${day} ${cls} lesson 5: ${rawChain[0]} not available, taking the next in the chain`, 'warn');
@@ -777,7 +830,7 @@ function generate() {
         if (!hr) log(`  ⚠ ${day} ${cls} lesson 5: nobody available — left blank`, 'err');
         bump(hr, 1); bumpDaily(hr, day, 1);
         classResult[cls].homeroom = hr;
-        placed(homeroomMorning[cls], cls); placed(hr, cls);
+        placed(hr, cls);
         // Recess and Dismissal: left blank (manual).
       }
     }
@@ -795,7 +848,7 @@ function generate() {
                             remark:`${dailyLoad(t, day)} G6 invigilation lessons today` });
     }
 
-    dayResults.push({ day, date:dayObj.date, hasCombined, classResult, sessions:dayObj.sessions, dayTeacherCampus, homeroomMorning, blockedToday });
+    dayResults.push({ day, date:dayObj.date, hasCombined, classResult, sessions:dayObj.sessions, dayTeacherCampus, blockedToday });
   }
   progress(60);
   log(`✓ Assignment complete. ${lessonSwapRows.length} lesson-swap conflicts detected.`, lessonSwapRows.length?'warn':'ok');
@@ -882,8 +935,9 @@ function generate() {
         const morn = cres.sessions[0], aft = cres.sessions[1];
         const lbl = s => s ? (s.notes ? `${s.subject}\n(${s.notes.replace(/^Actual exam\s*/i,'')})` : s.subject) : '';
         setStr(sc,5,'Homeroom', STY.subj); ensure(sc,6).s = STY.subj; addMerge(sc,5,sc,6);
-        const hrMorning = dr.homeroomMorning[cls] || '';
-        initRow(sc+1,5, hrMorning); initRow(sc+1,6, hrMorning);
+        // 08:20-08:55 homeroom: the literal text HRT, as in the reference
+        // workbook — not a named teacher.
+        initRow(sc+1,5, 'HRT'); initRow(sc+1,6, 'HRT');
         setStr(sc,7, lbl(morn), STY.subj); ensure(sc,8).s = STY.subj; addMerge(sc,7,sc,8);
         initRow(sc+1,7, morn && morn.invigilator); initRow(sc+1,8, morn && morn.invigilator);
         setStr(sc,9,'Recess', STY.subjRec); initRow(sc+1,9, '');
